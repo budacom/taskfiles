@@ -1,0 +1,171 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+set: [pipefail, x]
+silent: false
+
+vars:
+  COMPOSE_NETWORK: budadev
+  COMPOSE_PROJECT_NAME:
+    sh: basename $PWD
+  COMPOSE_RAILS_SERVICE: app
+  REQUIRED_BINS: docker docker-sync jq gcloud
+  SETUP_LOCALHOST_DOMAINS: ""
+  SETUP_DB_TASKS: db:prepare db:migrate:with_data
+
+env:
+  COMPOSE_PROJECT_NAME: '{{ .COMPOSE_PROJECT_NAME }}'
+
+tasks:
+  setup:
+    env:
+      COMPOSE_HTTP_TIMEOUT: 360
+    desc: Setup your local environment for the first time.
+    summary: |
+      Setup your local environment for the first time.
+
+      This will start docker sync and create the .env.local file.
+      It will also create a docker network for all the projects to communicate and build the app container image.
+
+      Finally it will run the database setup command to load the scheman and run pending migrations.
+    deps: [check:with_ssh]
+    cmds:
+      - cmd: echo "Setting up docker sync.."
+        silent: true
+      - docker-sync start
+
+      - cmd: echo 'Making sure you have a .env.local file'
+        silent: true
+      - touch .env.local
+
+      - cmd: echo 'Setup application specific /etc/hosts entries'
+        silent: true
+      - for: { var: SETUP_LOCALHOST_DOMAINS }
+        cmd: grep -qxF '127.0.0.1 {{ .ITEM }}' /etc/hosts || echo '127.0.0.1 {{ .ITEM }}' | sudo tee -a /etc/hosts
+
+      - cmd: echo "Preparing network.."
+        silent: true
+      - cmd: docker network inspect {{ .COMPOSE_NETWORK }} >/dev/null 2>&1 || docker network create {{ .COMPOSE_NETWORK }}
+
+      - cmd: echo "Building app container image.."
+        silent: true
+      - cmd: docker compose build {{ .COMPOSE_RAILS_SERVICE }}
+
+      - cmd: echo "Initializating database.."
+        silent: true
+      - docker compose run --rm {{ .COMPOSE_RAILS_SERVICE }} bundle exec rails {{ .SETUP_DB_TASKS }}
+
+      - cmd: echo "All done. Go back to the README.md"
+        silent: true
+
+  run:
+    desc: &desc Run a shell in the {{ .COMPOSE_RAILS_SERVICE }} container
+    summary: &summary |
+      Run a shell in the {{ .COMPOSE_RAILS_SERVICE }} container
+
+      This will run a shell in the {{ .COMPOSE_RAILS_SERVICE }} container, you can run any command you want from there.
+
+      You can also run any command passing as an argument to this task after `--`.
+      For example: `task rails:run -- bundle exec rails assets:precompile`
+    aliases: [shell]
+    deps: [check:with_ssh]
+    cmds:
+      - docker compose run --rm {{ .COMPOSE_RAILS_SERVICE }} {{ .CLI_ARGS | default "bash"}}
+
+  shell:test:
+    desc: *desc
+    summary: *summary
+    vars:
+      COMPOSE_RAILS_SERVICE: test
+    cmds:
+      - task: run
+        vars:
+          CLI_ARGS: bash
+
+  console:
+    desc: Run a rails console in the app container
+    cmds:
+      - task: run
+        vars:
+          CLI_ARGS: bundle exec rails c
+
+  guard:
+    desc: Run guard in the app container
+    vars:
+      COMPOSE_RAILS_SERVICE: test
+    cmds:
+      - task: run
+        vars:
+          CLI_ARGS: bundle exec guard
+
+  resync:
+    deps: [clean-cache]
+    desc: Resync the docker-sync container
+    cmds:
+      - docker-sync clean
+      - docker-sync start
+
+  clean-cache:
+    deps: [check]
+    desc: Remove all cache and orphan volumes
+    cmds:
+      - docker compose down --remove-orphans
+      - docker volume ls -q | grep {{ .COMPOSE_PROJECT_NAME }} | grep -e _cache$ | xargs -t -n 1 docker volume rm
+
+  destroy:
+    deps: [check]
+    desc: Remove all containers and volumes
+    prompt: >-
+      WARNING: This command will remove all volumes from the containers, you will need to setup you local environment from scratch.
+    cmds:
+      - docker compose down --volumes
+      - docker-sync clean
+      - docker rmi -f {{ .COMPOSE_PROJECT_NAME }}-dev:latest >/dev/null 2>&1
+
+  ## Internal tasks
+  check:
+    internal: true
+    silent: true
+    run: once
+    cmds:
+      - task: check:bins
+
+  check:with_ssh:
+    internal: true
+    silent: true
+    run: once
+    deps: [check]
+    cmds:
+      - task: ssh
+
+  check:bins:
+    internal: true
+    silent: true
+    run: once
+    cmds:
+      - |
+        echo "Checking for dependncies.."
+        for bin in {{ .REQUIRED_BINS }}; do
+          if ! command -v "$bin" > /dev/null; then
+            echo "Please install $bin"
+            exit 1
+          fi
+        done
+
+  ssh:
+    internal: true
+    silent: true
+    run: once
+    desc: Load ssh-agent and keys if needed.
+    cmds:
+      - |
+        echo "Loading ssh-agent and keys.."
+        if ssh-add -L | grep -qE 'no identities'; then
+          if ! ssh-add -k; then
+            echo "";
+            echo "No ssh keys found";
+            echo "Follow the Readme to create ssh keys and add them to your Github account.";
+            exit 1;
+          fi;
+        fi;
